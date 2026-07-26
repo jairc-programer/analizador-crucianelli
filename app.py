@@ -31,13 +31,28 @@ if boton_procesar:
             df_nt = pd.read_csv(archivo_nt) if archivo_nt.name.endswith('.csv') else pd.read_excel(archivo_nt)
             df_ot = pd.read_csv(archivo_ot) if archivo_ot.name.endswith('.csv') else pd.read_excel(archivo_ot)
             
-            # --- PROCESAMIENTO ---
+            # --- PROCESAMIENTO MB52 (MM) ---
             df_mb52['Trans./Trasl.'] = pd.to_numeric(df_mb52['Trans./Trasl.'], errors='coerce').fillna(0)
-            df_mm = df_mb52[df_mb52['Trans./Trasl.'] > 0][['Material', 'Trans./Trasl.']].groupby('Material').sum().reset_index()
+            df_mm = df_mb52[df_mb52['Trans./Trasl.'] > 0][['Material', 'Almacén', 'Trans./Trasl.']].groupby(['Material', 'Almacén']).sum().reset_index()
 
+            # --- PROCESAMIENTO NT / OT Abiertas ---
             nts_abiertas = set(pd.to_numeric(df_nt['Nº NT'], errors='coerce').dropna())
             ots_abiertas = set(pd.to_numeric(df_ot['Número de orden de transporte'], errors='coerce').dropna())
 
+            # --- EXTRACCIÓN DEL DOCUMENTO MATERIAL (Tu idea genial) ---
+            # Mapeamos qué NT o OT tiene qué documento
+            nt_doc_map = {}
+            if 'Nº NT' in df_nt.columns and 'Documento material' in df_nt.columns:
+                nt_doc_map = df_nt.dropna(subset=['Nº NT', 'Documento material']).set_index('Nº NT')['Documento material'].to_dict()
+            
+            ot_doc_map = {}
+            fallback_doc_map = {} # Plan B por si borraron la OT
+            if 'Número de orden de transporte' in df_ot.columns and 'Documento material' in df_ot.columns:
+                ot_doc_map = df_ot.dropna(subset=['Número de orden de transporte', 'Documento material']).set_index('Número de orden de transporte')['Documento material'].to_dict()
+                if 'Material' in df_ot.columns:
+                    fallback_doc_map = df_ot.dropna(subset=['Material', 'Documento material']).set_index('Material')['Documento material'].to_dict()
+
+            # --- PROCESAMIENTO WM (LX02) ---
             df_lx02['Tipo almacén'] = df_lx02['Tipo almacén'].astype(str)
             df_lx02['Stock disponible'] = pd.to_numeric(df_lx02['Stock disponible'], errors='coerce').fillna(0)
             df_lx02['Nº NT'] = pd.to_numeric(df_lx02['Nº NT'], errors='coerce').fillna(0)
@@ -53,15 +68,39 @@ if boton_procesar:
                 else:
                     return 'Cant_Fantasma_WM'
 
+            def obtener_doc_material(row):
+                # 1. Intenta sacar el Doc de la NT
+                if row['Nº NT'] in nt_doc_map:
+                    return nt_doc_map[row['Nº NT']]
+                # 2. Intenta sacar el Doc de la OT
+                elif row['Ref_OT_Doc'] in ot_doc_map:
+                    return ot_doc_map[row['Ref_OT_Doc']]
+                # 3. Plan B: Si la OT/NT se borró, busca cualquier Doc de ese material
+                elif row['Material'] in fallback_doc_map:
+                    return fallback_doc_map[row['Material']]
+                return None
+
             df_wm['Estado_WM'] = df_wm.apply(clasificar_linea_wm, axis=1)
+            df_wm['Doc_Ref_313'] = df_wm.apply(obtener_doc_material, axis=1)
+            
             df_wm['Stock disponible'] = df_wm['Stock disponible'].abs()
             df_wm_agrupado = df_wm.pivot_table(index='Material', columns='Estado_WM', values='Stock disponible', aggfunc='sum').fillna(0).reset_index()
+            
+            # Rescatamos el Documento Material para pegarlo al reporte final
+            df_docs_wm = df_wm.dropna(subset=['Doc_Ref_313']).groupby('Material')['Doc_Ref_313'].first().reset_index()
 
             for col in ['Cant_Pendiente_NT', 'Cant_Pendiente_OT', 'Cant_Fantasma_WM']:
                 if col not in df_wm_agrupado.columns:
                     df_wm_agrupado[col] = 0
 
+            # --- CRUCE FINAL ---
             resultado = pd.merge(df_mm, df_wm_agrupado, on='Material', how='left').fillna(0)
+            resultado = pd.merge(resultado, df_docs_wm, on='Material', how='left')
+
+            # Formato final al número de documento (para que no salga con decimales feos)
+            resultado['Doc_Ref_313'] = resultado['Doc_Ref_313'].fillna('Sin Doc')
+            resultado['Doc_Ref_313'] = resultado['Doc_Ref_313'].apply(lambda x: str(int(x)) if isinstance(x, (float, int)) and pd.notna(x) else x)
+
             resultado['WM_Justificado'] = resultado['Cant_Pendiente_NT'] + resultado['Cant_Pendiente_OT']
             resultado['Falta_Hacer_315'] = resultado['Trans./Trasl.'] - resultado['WM_Justificado']
 
@@ -74,7 +113,9 @@ if boton_procesar:
                     return "✅ OK - Pendiente Picking"
 
             resultado['Estado Final'] = resultado.apply(estado_final, axis=1)
-            columnas_finales = ['Material', 'Trans./Trasl.', 'Cant_Pendiente_NT', 'Cant_Pendiente_OT', 'Falta_Hacer_315', 'Estado Final']
+            
+            # Orden de las columnas
+            columnas_finales = ['Material', 'Almacén', 'Doc_Ref_313', 'Trans./Trasl.', 'Cant_Pendiente_NT', 'Cant_Pendiente_OT', 'Falta_Hacer_315', 'Estado Final']
             resultado_vista = resultado[columnas_finales].rename(columns={'Trans./Trasl.': 'Stock_MM_Traslado'})
 
             # --- MÉTRICAS VISUALES ---
@@ -92,7 +133,7 @@ if boton_procesar:
             st.markdown("---")
 
             # --- TABLAS EN PANTALLA ---
-            st.success("Cruce realizado exitosamente. Revisá el detalle a continuación:")
+            st.success("Cruce realizado exitosamente. Acá tenés los datos listos con el documento de referencia:")
             st.dataframe(resultado_vista, use_container_width=True)
             
             csv = resultado_vista.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
